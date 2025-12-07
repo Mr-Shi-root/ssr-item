@@ -1,0 +1,43 @@
+{
+  "name": "ssr-item",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "concurrently \"npm run dev:server\" \"npm run dev:client\"",
+    "dev:server": "nodemon --watch src/server --exec babel-node src/server/index.js",
+    "dev:client": "webpack --config config/webpack.client.js --watch",
+    "build": "npm run build:client && npm run build:server && npm run build:skeleton",
+    "build:client": "webpack --config config/webpack.client.js --mode production",
+    "build:server": "webpack --config config/webpack.server.js --mode production",
+    "build:skeleton": "webpack --config config/webpack.skeleton.js --mode production",
+    "start": "NODE_ENV=production node build/server.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "ioredis": "^5.8.2",
+    "koa": "^2.15.0",
+    "koa-router": "^12.0.1",
+    "koa-static": "^5.0.0",
+    "lru-cache": "^7.18.3",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.23.6",
+    "@babel/node": "^7.22.19",
+    "@babel/preset-env": "^7.23.6",
+    "@babel/preset-react": "^7.23.3",
+    "babel-loader": "^9.1.3",
+    "webpack": "^5.89.0",
+    "webpack-cli": "^5.1.4",
+    "webpack-node-externals": "^3.0.0",
+    "html-webpack-plugin": "^5.6.0",
+    "css-loader": "^6.8.1",
+    "style-loader": "^3.3.3",
+    "nodemon": "^3.0.2",
+    "concurrently": "^8.2.2"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "SSR商品详情页，支持普通商品SSR和秒杀商品CSR骨架页"
+}

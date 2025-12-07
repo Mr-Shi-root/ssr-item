@@ -1,0 +1,7 @@
+node_modules/
+build/
+public/*.js
+public/*.map
+public/skeleton/
+.DS_Store
+*.log
