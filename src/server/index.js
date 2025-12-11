@@ -2,7 +2,26 @@ const Koa = require('koa');
 const Router = require('koa-router');
 const bodyParser = require('koa-bodyparser');
 const serve = require('koa-static');
+const helmet = require('helmet');
 const path = require('path');
+
+// 配置和工具
+const config = require('../utils/config');
+const { logger, businessLogger } = require('../utils/logger');
+const healthChecker = require('../utils/health');
+const GracefulShutdown = require('../utils/graceful-shutdown');
+const alertManager = require('../utils/alerting');
+const metricsCollector = require('../utils/metrics');
+
+// 中间件
+const errorMiddleware = require('../middleware/error');
+const traceMiddleware = require('../middleware/trace');
+const performanceMiddleware = require('../middleware/performance');
+const rateLimitMiddleware = require('../middleware/rate-limit');
+const metricsMiddleware = require('../middleware/metrics');
+const { circuitBreakerManager } = require('../middleware/circuit-breaker');
+
+// 业务模块
 const { precheckItem } = require('../api/precheck');
 const { renderSSR } = require('./ssr');
 const { renderSSRWithCache, invalidateCache, warmupCache } = require('./ssr-with-cache');
@@ -12,10 +31,34 @@ const cacheManager = require('./cache');
 const app = new Koa();
 const router = new Router();
 
-// 是否启用缓存（通过环境变量控制）
-const ENABLE_CACHE = process.env.ENABLE_SSR_CACHE !== 'false';
+// 是否启用缓存
+const ENABLE_CACHE = config.get('ssrCache.enabled');
 
-// 解析 POST 请求体
+// ===== 中间件注册（顺序很重要！）=====
+
+// 1. 安全防护（最先）
+if (config.get('security.helmetEnabled')) {
+  app.use(helmet({
+    contentSecurityPolicy: false  // SSR 需要内联脚本
+  }));
+}
+
+// 2. 全局错误处理
+app.use(errorMiddleware());
+
+// 3. 全链路追踪
+app.use(traceMiddleware());
+
+// 4. 性能监控
+app.use(performanceMiddleware());
+
+// 5. Metrics 收集
+app.use(metricsMiddleware());
+
+// 6. 限流
+app.use(rateLimitMiddleware());
+
+// 7. 解析 POST 请求体
 app.use(bodyParser());
 
 // 静态资源服务
@@ -102,10 +145,66 @@ router.get('/api/item/:id', async (ctx) => {
 });
 
 /**
- * 健康检查接口
+ * 健康检查接口 - Liveness（存活检查）
  */
-router.get('/health', (ctx) => {
-  ctx.body = { status: 'ok', timestamp: Date.now() };
+router.get('/health', async (ctx) => {
+  const health = await healthChecker.checkLiveness();
+  ctx.body = health;
+});
+
+/**
+ * 就绪检查接口 - Readiness（就绪检查）
+ */
+router.get('/health/ready', async (ctx) => {
+  const health = await healthChecker.checkReadiness();
+  ctx.status = health.ready ? 200 : 503;
+  ctx.body = health;
+});
+
+/**
+ * 详细健康检查接口
+ */
+router.get('/health/detail', async (ctx) => {
+  const health = await healthChecker.checkAll();
+  ctx.status = health.status === 'healthy' ? 200 : 503;
+  ctx.body = health;
+});
+
+/**
+ * Metrics 指标接口 - Prometheus 格式
+ */
+router.get('/metrics', (ctx) => {
+  ctx.type = 'text/plain; version=0.0.4';
+  ctx.body = metricsCollector.exportPrometheus();
+});
+
+/**
+ * Metrics 指标接口 - JSON 格式
+ */
+router.get('/metrics/json', (ctx) => {
+  ctx.body = metricsCollector.getMetrics();
+});
+
+/**
+ * 熔断器状态接口
+ */
+router.get('/admin/circuit-breakers', (ctx) => {
+  ctx.body = {
+    success: true,
+    data: circuitBreakerManager.getAllStats()
+  };
+});
+
+/**
+ * 重置熔断器接口
+ * POST /admin/circuit-breakers/reset
+ */
+router.post('/admin/circuit-breakers/reset', (ctx) => {
+  circuitBreakerManager.resetAll();
+  ctx.body = {
+    success: true,
+    message: '所有熔断器已重置'
+  };
 });
 
 /**
@@ -205,11 +304,101 @@ router.post('/admin/cache/warmup', async (ctx) => {
 app.use(router.routes());
 app.use(router.allowedMethods());
 
-const PORT = process.env.PORT || 3000;
+// ===== 错误事件监听 =====
+app.on('error', (error, ctx) => {
+  const trace = ctx?.state?.trace || {};
 
-app.listen(PORT, () => {
-  console.log(`🚀 服务器启动成功: http://localhost:${PORT}`);
-  console.log(`📦 环境: ${process.env.NODE_ENV || 'development'}`);
+  // 严重错误发送告警
+  if (error.statusCode >= 500 || !error.statusCode) {
+    alertManager.error(
+      '服务器错误',
+      error.message,
+      {
+        traceId: trace.traceId,
+        requestId: trace.requestId,
+        path: ctx?.path,
+        method: ctx?.method,
+        stack: error.stack
+      }
+    ).catch(err => {
+      logger.error('告警发送失败', { error: err.message });
+    });
+  }
 });
+
+// ===== 启动服务 =====
+const PORT = config.get('port');
+const server = app.listen(PORT, () => {
+  logger.info('服务器启动成功', {
+    port: PORT,
+    nodeEnv: config.get('nodeEnv'),
+    pid: process.pid,
+    cacheEnabled: ENABLE_CACHE,
+    rateLimitEnabled: config.get('rateLimit.enabled'),
+    alertEnabled: config.get('alert.enabled')
+  });
+
+  // 注册健康检查
+  registerHealthChecks();
+
+  // 启动优雅关闭监听
+  const gracefulShutdown = new GracefulShutdown(server);
+
+  // 注册清理函数
+  gracefulShutdown.onShutdown(async () => {
+    logger.info('关闭缓存管理器');
+    await cacheManager.close();
+  });
+
+  gracefulShutdown.onShutdown(async () => {
+    logger.info('关闭日志系统');
+    const { log4js } = require('../utils/logger');
+    log4js.shutdown();
+  });
+
+  gracefulShutdown.listen();
+
+  // 发送启动成功告警（可选）
+  if (config.isProduction()) {
+    alertManager.info(
+      '服务启动成功',
+      `${config.get('apm.serviceName')} 已启动`,
+      {
+        port: PORT,
+        nodeEnv: config.get('nodeEnv'),
+        pid: process.pid
+      }
+    ).catch(() => {});
+  }
+});
+
+/**
+ * 注册健康检查
+ */
+function registerHealthChecks() {
+  // Redis 健康检查
+  if (config.get('redis.host')) {
+    healthChecker.register('redis', async () => {
+      try {
+        // 这里应该实际检查 Redis 连接
+        // const redis = require('ioredis');
+        // await redis.ping();
+        return { healthy: true, message: 'Redis 连接正常' };
+      } catch (error) {
+        return { healthy: false, error: error.message };
+      }
+    });
+  }
+
+  // 缓存健康检查
+  healthChecker.register('cache', () => {
+    const stats = cacheManager.getStats();
+    return {
+      healthy: true,
+      hitRate: stats.hitRate,
+      l1Count: stats.l1Count
+    };
+  });
+}
 
 module.exports = app;

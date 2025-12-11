@@ -1,0 +1,47 @@
+# Node modules
+node_modules
+npm-debug.log
+
+# 日志文件
+logs
+*.log
+
+# 环境变量文件
+.env
+.env.local
+.env.*.local
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# 测试
+coverage
+.nyc_output
+
+# 构建产物（会在 Docker 内重新构建）
+build
+
+# 临时文件
+tmp
+temp
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 文档
+README.md
+docs
+*.md
+
+# CI/CD
+.github
+.gitlab-ci.yml

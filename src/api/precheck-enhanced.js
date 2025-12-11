@@ -13,15 +13,18 @@ const { cacheHelper } = require('../utils/redis');
 
 // 熔断器状态
 let circuitBreaker = {
-  failureCount: 0,
-  lastFailureTime: 0,
-  state: 'CLOSED' // CLOSED | OPEN | HALF_OPEN
+  failureCount: 0,          // 失败次数
+  successCount: 0,          // 成功次数（半开状态用）
+  lastFailureTime: 0,       // 最后失败时间
+  halfOpenAttempts: 0,      // 半开状态已尝试次数
+  state: 'CLOSED'           // CLOSED | OPEN | HALF_OPEN
 };
 
 const CIRCUIT_BREAKER_CONFIG = {
   failureThreshold: 5,      // 失败 5 次后熔断
   timeout: 30000,           // 熔断 30 秒
-  halfOpenRequests: 3       // 半开状态允许 3 次尝试
+  halfOpenRequests: 3,      // 半开状态允许 3 次尝试
+  successThreshold: 2       // 半开状态连续成功 2 次后恢复
 };
 
 /**
@@ -38,6 +41,8 @@ async function precheckItemEnhanced(itemId) {
       if (now - circuitBreaker.lastFailureTime > CIRCUIT_BREAKER_CONFIG.timeout) {
         // 进入半开状态
         circuitBreaker.state = 'HALF_OPEN';
+        circuitBreaker.halfOpenAttempts = 0;
+        circuitBreaker.successCount = 0;
         console.log('🔄 熔断器进入半开状态');
       } else {
         // 熔断中，直接降级
@@ -46,7 +51,19 @@ async function precheckItemEnhanced(itemId) {
       }
     }
 
-    // 2. 查询 Redis 缓存
+    // 2. 半开状态限流：只允许指定次数的请求通过
+    if (circuitBreaker.state === 'HALF_OPEN') {
+      if (circuitBreaker.halfOpenAttempts >= CIRCUIT_BREAKER_CONFIG.halfOpenRequests) {
+        // 已达到半开状态的尝试次数上限，继续降级
+        console.log(`⚠️ 半开状态尝试次数已达上限 (${circuitBreaker.halfOpenAttempts}/${CIRCUIT_BREAKER_CONFIG.halfOpenRequests})，使用降级策略`);
+        return getFallbackStrategy(itemId);
+      }
+      // 增加尝试计数
+      circuitBreaker.halfOpenAttempts++;
+      console.log(`🔄 半开状态尝试 ${circuitBreaker.halfOpenAttempts}/${CIRCUIT_BREAKER_CONFIG.halfOpenRequests}`);
+    }
+
+    // 3. 查询 Redis 缓存
     const cached = await cacheHelper.get(cacheKey, 'precheck');
     if (cached) {
       const perfTime = Date.now() - perfStart;
@@ -55,10 +72,13 @@ async function precheckItemEnhanced(itemId) {
       // 记录性能指标
       recordMetrics('precheck', 'cache_hit', perfTime);
 
+      // 缓存命中也算成功，帮助熔断器恢复
+      handleCircuitBreakerSuccess();
+
       return cached;
     }
 
-    // 3. 调用预检 API
+    // 4. 调用预检 API
     console.log(`⚠️ 预检缓存未命中: ${itemId}，调用接口`);
 
     const apiStart = Date.now();
@@ -79,32 +99,72 @@ async function precheckItemEnhanced(itemId) {
     const totalTime = Date.now() - perfStart;
     recordMetrics('precheck', 'api_call', totalTime);
 
-    // 7. 熔断器恢复
-    if (circuitBreaker.state === 'HALF_OPEN') {
-      circuitBreaker.state = 'CLOSED';
-      circuitBreaker.failureCount = 0;
-      console.log('✅ 熔断器恢复正常');
-    }
+    // 7. 熔断器成功处理
+    handleCircuitBreakerSuccess();
 
     return strategy;
 
   } catch (error) {
     console.error('预检接口调用失败:', error);
 
-    // 熔断器计数
-    circuitBreaker.failureCount++;
-    circuitBreaker.lastFailureTime = Date.now();
-
-    if (circuitBreaker.failureCount >= CIRCUIT_BREAKER_CONFIG.failureThreshold) {
-      circuitBreaker.state = 'OPEN';
-      console.log('🔴 熔断器开启');
-    }
+    // 熔断器失败处理
+    handleCircuitBreakerFailure();
 
     // 记录错误指标
     recordMetrics('precheck', 'error', Date.now() - perfStart);
 
     // 降级策略
     return getFallbackStrategy(itemId);
+  }
+}
+
+/**
+ * 熔断器成功处理
+ */
+function handleCircuitBreakerSuccess() {
+  if (circuitBreaker.state === 'HALF_OPEN') {
+    // 半开状态：记录成功次数
+    circuitBreaker.successCount++;
+    console.log(`✅ 半开状态成功 ${circuitBreaker.successCount}/${CIRCUIT_BREAKER_CONFIG.successThreshold}`);
+
+    // 连续成功达到阈值，恢复到关闭状态
+    if (circuitBreaker.successCount >= CIRCUIT_BREAKER_CONFIG.successThreshold) {
+      circuitBreaker.state = 'CLOSED';
+      circuitBreaker.failureCount = 0;
+      circuitBreaker.successCount = 0;
+      circuitBreaker.halfOpenAttempts = 0;
+      console.log('✅ 熔断器恢复正常 (CLOSED)');
+    }
+  } else if (circuitBreaker.state === 'CLOSED') {
+    // 关闭状态：重置失败计数
+    if (circuitBreaker.failureCount > 0) {
+      circuitBreaker.failureCount = 0;
+    }
+  }
+}
+
+/**
+ * 熔断器失败处理
+ */
+function handleCircuitBreakerFailure() {
+  if (circuitBreaker.state === 'HALF_OPEN') {
+    // 半开状态失败：立即重新打开熔断器
+    circuitBreaker.state = 'OPEN';
+    circuitBreaker.lastFailureTime = Date.now();
+    circuitBreaker.successCount = 0;
+    circuitBreaker.halfOpenAttempts = 0;
+    console.log('🔴 半开状态失败，熔断器重新开启 (OPEN)');
+  } else {
+    // 关闭状态失败：增加失败计数
+    circuitBreaker.failureCount++;
+    circuitBreaker.lastFailureTime = Date.now();
+
+    if (circuitBreaker.failureCount >= CIRCUIT_BREAKER_CONFIG.failureThreshold) {
+      circuitBreaker.state = 'OPEN';
+      console.log(`🔴 失败次数达到阈值 (${circuitBreaker.failureCount}/${CIRCUIT_BREAKER_CONFIG.failureThreshold})，熔断器开启 (OPEN)`);
+    } else {
+      console.log(`⚠️ 失败次数: ${circuitBreaker.failureCount}/${CIRCUIT_BREAKER_CONFIG.failureThreshold}`);
+    }
   }
 }
 

@@ -1,0 +1,78 @@
+# Prometheus 告警规则
+groups:
+  - name: ssr_item_alerts
+    interval: 30s
+    rules:
+      # 服务可用性告警
+      - alert: ServiceDown
+        expr: up{job="ssr-item-service"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "SSR 服务不可用"
+          description: "{{ $labels.instance }} 服务已下线超过 1 分钟"
+
+      # 高错误率告警
+      - alert: HighErrorRate
+        expr: |
+          rate(http_errors_total[5m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HTTP 错误率过高"
+          description: "{{ $labels.instance }} 错误率超过阈值"
+
+      # 慢请求告警
+      - alert: SlowRequests
+        expr: |
+          histogram_quantile(0.95, rate(http_request_duration_milliseconds_bucket[5m])) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "请求响应时间过长"
+          description: "{{ $labels.instance }} P95 响应时间超过 1 秒"
+
+      # 内存使用告警
+      - alert: HighMemoryUsage
+        expr: |
+          (nodejs_memory_heap_used_bytes / nodejs_memory_heap_total_bytes) * 100 > 90
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用率过高"
+          description: "{{ $labels.instance }} 内存使用率超过 90%"
+
+      # 熔断器打开告警
+      - alert: CircuitBreakerOpen
+        expr: circuit_breaker_state > 0.5
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "熔断器已打开"
+          description: "{{ $labels.name }} 熔断器已触发"
+
+      # Redis 连接失败告警
+      - alert: RedisDown
+        expr: up{job="redis"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Redis 服务不可用"
+          description: "Redis 连接失败超过 1 分钟"
+
+      # 限流告警
+      - alert: HighRateLimitRejection
+        expr: |
+          rate(circuit_breaker_rejected_total[5m]) > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "限流拒绝率过高"
+          description: "{{ $labels.instance }} 限流拒绝率过高"
